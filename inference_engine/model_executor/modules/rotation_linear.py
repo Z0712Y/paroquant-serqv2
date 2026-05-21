@@ -76,6 +76,8 @@ class RotateLinearInt4(nn.Module):
         rotation_angles=None,
         rotation_pairs=None,
         channel_scales=None,
+        significant_channels=None,
+        lora_R=None,
     ):
         super().__init__()
         self.in_features = in_feat
@@ -89,6 +91,22 @@ class RotateLinearInt4(nn.Module):
         self.qlinear = WQLinear(
             4, 128, self.in_features, self.out_features, bias, dtype=dtype
         )
+        if significant_channels is not None:
+            self.register_buffer(
+                "significant_channels",
+                significant_channels.clone().long().contiguous(),
+            )
+        else:
+            self.register_buffer(
+                "significant_channels",
+                torch.empty(0, dtype=torch.long, device="cuda"),
+            )
+        if lora_R is not None:
+            self.lora_R = nn.Parameter(lora_R.clone().contiguous())
+        else:
+            self.lora_R = nn.Parameter(
+                torch.zeros(out_feat, 0, device="cuda", dtype=dtype)
+            )
 
     @classmethod
     def from_linear(
@@ -101,6 +119,8 @@ class RotateLinearInt4(nn.Module):
         qzeros=None,
         rotate_weight=False,
         init_only=True,
+        significant_channels=None,
+        lora_R=None,
     ):
         rotate_linear = cls(
             linear.in_features,
@@ -110,6 +130,8 @@ class RotateLinearInt4(nn.Module):
             rotation_angles,
             rotation_pairs,
             channel_scales,
+            significant_channels,
+            lora_R,
         )
         if rotate_weight:
             with torch.no_grad():
@@ -134,9 +156,16 @@ class RotateLinearInt4(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
+        # 补偿路径：必须在旋转前提取显著通道（旋转会混合通道语义）
+        if self.significant_channels.numel() > 0 and self.lora_R.shape[1] > 0:
+            x_sig = x[..., self.significant_channels]
+            y_res = x_sig @ self.lora_R.T
+        else:
+            y_res = 0.0
+
         x = self.rotation(x)
-        x = self.qlinear(x)
-        return x
+        y_main = self.qlinear(x)
+        return y_main + y_res
 
     def buffer_name(self, buffer_name: str):
         if buffer_name == "qlinear.qweight":
@@ -151,6 +180,10 @@ class RotateLinearInt4(nn.Module):
             return self.rotation.pairs
         elif buffer_name == "rotation.channel_scales":
             return self.rotation.channel_scales
+        elif buffer_name == "significant_channels":
+            return self.significant_channels
+        elif buffer_name == "lora_R":
+            return self.lora_R
         raise ValueError(f"Invalid buffer name: {buffer_name}")
 
 
@@ -273,6 +306,8 @@ if can_import_vllm:
             rotation_angles=None,
             rotation_pairs=None,
             channel_scales=None,
+            significant_channels=None,
+            lora_R=None,
         ):
             super().__init__()
             self.in_features = in_feat
@@ -286,12 +321,33 @@ if can_import_vllm:
             self.qlinear = AWQMarlinLinear(
                 4, 128, self.in_features, self.out_features, bias, dtype=dtype
             )
+            if significant_channels is not None:
+                self.register_buffer(
+                    "significant_channels",
+                    significant_channels.clone().long().contiguous(),
+                )
+            else:
+                self.register_buffer(
+                    "significant_channels",
+                    torch.empty(0, dtype=torch.long, device="cuda"),
+                )
+            if lora_R is not None:
+                self.lora_R = nn.Parameter(lora_R.clone().contiguous())
+            else:
+                self.lora_R = nn.Parameter(
+                    torch.zeros(out_feat, 0, device="cuda", dtype=dtype)
+                )
 
         @torch.no_grad()
         def forward(self, x):
+            if self.significant_channels.numel() > 0 and self.lora_R.shape[1] > 0:
+                x_sig = x[..., self.significant_channels]
+                y_res = x_sig @ self.lora_R.T
+            else:
+                y_res = 0.0
             x = self.rotation(x)
             x = self.qlinear(x)
-            return x
+            return x + y_res
 
         def buffer_name(self, buffer_name: str):
             if buffer_name == "qlinear.qweight":
@@ -306,4 +362,8 @@ if can_import_vllm:
                 return self.rotation.pairs
             elif buffer_name == "rotation.channel_scales":
                 return self.rotation.channel_scales
+            elif buffer_name == "significant_channels":
+                return self.significant_channels
+            elif buffer_name == "lora_R":
+                return self.lora_R
             raise ValueError(f"Invalid buffer name: {buffer_name}")

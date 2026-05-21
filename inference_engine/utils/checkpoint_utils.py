@@ -65,6 +65,8 @@ def replace_linears_from_pt(
             qscales,
             qzeros_float,
             qzeros,
+            significant_channels,
+            lora_R,
         ) = transform_from_pt(blob, include_qsz=True)
         lin.weight.copy_(w)
         if not marlin:
@@ -77,6 +79,8 @@ def replace_linears_from_pt(
                 qzeros=qzeros,
                 rotate_weight=True,
                 init_only=False,
+                significant_channels=significant_channels,
+                lora_R=lora_R,
             )
         else:
             new_rotate_linear = RotateLinearMarlinInt4.from_linear(
@@ -88,6 +92,8 @@ def replace_linears_from_pt(
                 qzeros=qzeros,
                 rotate_weight=True,
                 init_only=False,
+                significant_channels=significant_channels,
+                lora_R=lora_R,
             )
         new_rotate_linear.to("cpu")
         setattr(parent, key, new_rotate_linear)

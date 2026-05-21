@@ -60,6 +60,14 @@ if __name__ == "__main__":
             qlayer = PseudoQuantizedLinear.from_state_dict(sd)
             # 获取伪量化后的浮点权重（即量化再反量化后的结果）
             weight = qlayer.pseudo_weight()
+            # 将低秩补偿融合进稠密权重：W_eff[:, S] += lora_R.T
+            # 这样稠密前向 X @ W_eff.T 即等价于 Y_main + Y_res
+            if (
+                qlayer.significant_channels.numel() > 0
+                and qlayer.lora_R is not None
+                and qlayer.lora_R.shape[1] > 0
+            ):
+                weight[:, qlayer.significant_channels] += qlayer.lora_R.T
             # 将该权重复制到原始模型的对应 linear 层中
             module.weight.data.copy_(weight)
 

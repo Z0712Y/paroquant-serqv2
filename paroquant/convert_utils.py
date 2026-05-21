@@ -113,6 +113,10 @@ def transform_from_pt(pt_path, krot=8, include_qsz=False):
     qmin = 0
     qmax = 2**n_bit - 1
     round_zero_point = clamp_ste(-round_ste(qzeros), qmin, qmax)
+
+    significant_channels = pt.get("significant_channels", None)
+    lora_R = pt.get("lora_R", None)
+
     if include_qsz:
         return (
             weight,
@@ -122,9 +126,18 @@ def transform_from_pt(pt_path, krot=8, include_qsz=False):
             qscales,
             qzeros,
             round_zero_point,
+            significant_channels,
+            lora_R,
         )
     else:
-        return weight, rotation_pairs, rotation_angles, channel_scales
+        return (
+            weight,
+            rotation_pairs,
+            rotation_angles,
+            channel_scales,
+            significant_channels,
+            lora_R,
+        )
 
 
 def transform_to_kernel_data(

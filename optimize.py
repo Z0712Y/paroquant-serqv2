@@ -91,6 +91,9 @@ class Config:
     # 显著性分数计算指标: "l2" | "maxabs" | "var"，仅在 selection_mode="greedy" 时生效
     metric: str = "l2"
 
+    # 显著通道数量（用于 SERQ 式低秩残差补偿），0 表示关闭
+    num_outlier: int = 0
+
 
 def main():
     args = simple_parsing.parse(
@@ -253,6 +256,51 @@ def main():
         if not all_files_exist:
             logger.info(f"Initializing rotation parameters...")
 
+            # ==========================================================
+            # 步骤2: 激活显著性分析（新增，借鉴 SERQ）
+            # ==========================================================
+            sig_channels_map = {}
+            if args.num_outlier > 0:
+                logger.info(
+                    f"Layer {layer_idx}: Capturing activation saliency for {len(linear_modules)} linears..."
+                )
+                activation_map = {}
+                hooks = []
+
+                for name, old_module in linear_modules.items():
+                    if name in args.skipped_modules:
+                        continue
+
+                    def make_hook(n):
+                        def hook(mod, inp, out):
+                            x_in = inp[0]
+                            if isinstance(x_in, tuple):
+                                x_in = x_in[0]
+                            if n not in activation_map:
+                                activation_map[n] = []
+                            activation_map[n].append(x_in.detach().cpu().float())
+
+                        return hook
+
+                    h = old_module.register_forward_hook(make_hook(name))
+                    hooks.append(h)
+
+                with torch.no_grad():
+                    for inp_batch in layer_input_batches:
+                        layer(inp_batch.to(device), **kwargs)
+
+                for h in hooks:
+                    h.remove()
+
+                for name, acts in activation_map.items():
+                    x_cat = torch.cat(acts, dim=0)  # [total_tokens, in_features]
+                    s = x_cat.abs().amax(dim=0)  # [in_features]
+                    _, topk_idx = torch.topk(s, args.num_outlier)
+                    sig_channels_map[name] = topk_idx.sort().values.to(device)
+
+                del activation_map
+                empty_cache()
+
         for name, old_module in linear_modules.items():
             if name in args.skipped_modules:
                 continue
@@ -304,6 +352,8 @@ def main():
             rotation_pairs = [npairs, angles, mask]
             channel_scales = initial_scales
 
+            sig_channels = sig_channels_map.get(name, None)
+
             new_module = PseudoQuantizedLinear(
                 old_module,
                 rotation_pairs,
@@ -311,7 +361,12 @@ def main():
                 group_size=args.group_size,
                 n_bits=args.n_bit,
                 num_rotations=args.num_rotations,
+                significant_channels=sig_channels,
+                num_outlier=args.num_outlier,
             )
+
+            # 用 SVD 主成分初始化 lora_R，提供良好的低秩补偿起点
+            new_module.init_lora_R_by_svd(args.num_outlier)
 
             set_module_by_name(layer, name, new_module)
             old_module.cpu()

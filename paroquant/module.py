@@ -21,6 +21,9 @@ class PseudoQuantizedLinear(nn.Module):
         group_size: int,
         n_bits: int,
         num_rotations: int,
+        significant_channels: Optional[torch.Tensor] = None,
+        lora_R: Optional[torch.Tensor] = None,
+        num_outlier: int = 0,
     ) -> None:
         super().__init__()
         self.enable_checkpoint = False
@@ -92,6 +95,29 @@ class PseudoQuantizedLinear(nn.Module):
         self.register_buffer("n_bits", n_bits)
         self.register_buffer("group_size", group_size)
 
+        # SERQ-style significant channels and low-rank compensation
+        if significant_channels is not None:
+            self.register_buffer(
+                "significant_channels",
+                significant_channels.clone().long().to("cuda"),
+            )
+        else:
+            self.register_buffer(
+                "significant_channels",
+                torch.empty(0, dtype=torch.long, device="cuda"),
+            )
+        if lora_R is not None:
+            self.lora_R = nn.Parameter(lora_R.clone().to("cuda"))
+        else:
+            self.lora_R = nn.Parameter(
+                torch.zeros(
+                    self.out_feat,
+                    max(num_outlier, 0),
+                    device="cuda",
+                    dtype=self.weight.dtype,
+                )
+            )
+
     def forward(
         self, x: torch.Tensor, weight_update: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -99,10 +125,17 @@ class PseudoQuantizedLinear(nn.Module):
         if weight_update is not None:
             weight = weight + weight_update
         weight = self._pseudo_quantize(weight)
-        x = self.checkpointed(torch.matmul, x, weight.T)
+        y_main = self.checkpointed(torch.matmul, x, weight.T)
         if getattr(self, "bias", None) is not None:
-            x = x + self.bias
-        return x
+            y_main = y_main + self.bias
+
+        # Compensation path: significant-channel low-rank reconstruction
+        if self.significant_channels.numel() > 0 and self.lora_R.shape[1] > 0:
+            x_sig = x[..., self.significant_channels]
+            y_res = x_sig @ self.lora_R.T
+            y_main = y_main + y_res
+
+        return y_main
 
     def _pseudo_quantize(self, weight: torch.Tensor) -> torch.Tensor:
         weight = weight * self.channel_scales
@@ -148,6 +181,7 @@ class PseudoQuantizedLinear(nn.Module):
         angles: bool = False,
         channel_scales: bool = False,
         quantizer: bool = False,
+        lora_R: bool = False,
     ) -> None:
         self.weight.requires_grad = weight
         if self.bias is not None:
@@ -156,6 +190,7 @@ class PseudoQuantizedLinear(nn.Module):
             self.angles_grouped.requires_grad = angles
         if self.channel_scales is not None:
             self.channel_scales.requires_grad = channel_scales
+        self.lora_R.requires_grad = lora_R
 
         if quantizer and self.quantizer is None:
             # Initialize the quantizer with the current rotated weight
@@ -196,6 +231,8 @@ class PseudoQuantizedLinear(nn.Module):
             return [self.channel_scales]
         elif name == "quantizer":
             return self.quantizer.optim_params()
+        elif name == "lora_R":
+            return [self.lora_R]
         else:
             raise ValueError(f"Unknown parameter group: {name}")
 
@@ -225,6 +262,10 @@ class PseudoQuantizedLinear(nn.Module):
             "mask", torch.zeros_like(angles_grouped, dtype=torch.bool)
         )
 
+        significant_channels = state_dict.get("significant_channels", None)
+        lora_R = state_dict.get("lora_R", None)
+        num_outlier = lora_R.shape[1] if lora_R is not None else 0
+
         qlinear = PseudoQuantizedLinear(
             linear,
             [pairs_grouped, angles_grouped, mask],
@@ -232,11 +273,20 @@ class PseudoQuantizedLinear(nn.Module):
             group_size=group_size,
             n_bits=n_bits,
             num_rotations=num_rotations,
+            significant_channels=significant_channels,
+            lora_R=lora_R,
+            num_outlier=num_outlier,
         )
 
         # Initialize the quantizer
         if "quantizer.scale" in state_dict:
             qlinear.set_optim_enabled(quantizer=True)
+
+        # 向后兼容：旧版本 state_dict 可能缺少 lora_R / significant_channels
+        if "lora_R" not in state_dict:
+            state_dict["lora_R"] = qlinear.lora_R.data
+        if "significant_channels" not in state_dict:
+            state_dict["significant_channels"] = qlinear.significant_channels.data
 
         qlinear.load_state_dict(state_dict)
         return qlinear
@@ -253,6 +303,41 @@ class PseudoQuantizedLinear(nn.Module):
     @torch.no_grad()
     def pseudo_weight(self) -> torch.Tensor:
         return self._pseudo_quantize(self.weight).detach()
+
+    @torch.no_grad()
+    def init_lora_R_by_svd(self, num_outlier: int):
+        """
+        对全精度权重与伪量化权重的残差矩阵做 SVD，
+        用主成分（左奇异向量 × 奇异值）初始化 lora_R，
+        使低秩补偿从一开始就指向正确的误差缩减方向。
+        """
+        if num_outlier <= 0 or self.lora_R.shape[1] == 0:
+            return
+        weight = self.weight
+        # ① 通道缩放
+        w = weight * self.channel_scales
+        # ② 正向 Givens 旋转
+        w = scaled_pairwise_rotation(
+            w, self.pairs_grouped, self.angles_grouped, None, self.group_size
+        )
+        # ③ 分组均匀量化（静态估计，不依赖可学习 quantizer）
+        w = UniformAffineQuantizer.pseudo_quantize(w, self.n_bits, self.group_size)
+        # ④ 逆向 Givens 旋转
+        w = scaled_pairwise_rotation(
+            w,
+            torch.flip(self.pairs_grouped, dims=[0]),
+            -torch.flip(self.angles_grouped, dims=[0]),
+            None,
+            self.group_size,
+        )
+        # ⑤ 逆通道缩放
+        w = w / self.channel_scales.view(1, -1)
+        residual = weight - w
+        # SVD 提取主成分
+        U, Svals, Vt = torch.linalg.svd(residual, full_matrices=False)
+        r = min(num_outlier, Svals.numel())
+        self.lora_R.data.zero_()
+        self.lora_R.data[:, :r] = (U[:, :r] * Svals[:r]).to(self.weight.dtype)
 
 
 @torch.no_grad()

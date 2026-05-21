@@ -1,6 +1,6 @@
 命令: bash experiments/optimize/4bit2.sh /home/hhw/zy/models/Qwen3-4B
 工作目录: /home/hhw/zy/paroquant
-启动时间: 2026-05-09 09:00:01
+启动时间: 2026-05-19 16:45:09
 
 ========================================
 结构化配置参数
@@ -28,7 +28,7 @@
   Val Size:      64
 
 【其他】
-  GPU:           0
+  GPU:           2
   Resume:        是
   Seed:          0
 ========================================
